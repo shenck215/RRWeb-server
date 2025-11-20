@@ -24,25 +24,60 @@ type EventsRequestBody =
 			payload: string; // base64 + gzip
 	  };
 
-type KvListPage = {
-	keys: { name: string }[];
-	list_complete: boolean;
-	cursor?: string;
+const app = new Hono<{ Bindings: Env }>();
+
+// ------------------ 代数管理相关 ------------------
+
+// 记录当前代数的 KV key
+const GEN_KEY = "__GEN__";
+
+/** 获取当前代数（不存在则初始化为 1） */
+const getGeneration = async (env: Env): Promise<number> => {
+	const v = await env.RRWEB_SERVER.get(GEN_KEY);
+	if (!v) {
+		await env.RRWEB_SERVER.put(GEN_KEY, "1");
+		return 1;
+	}
+	const n = Number(v);
+	if (!Number.isFinite(n) || n < 1) {
+		await env.RRWEB_SERVER.put(GEN_KEY, "1");
+		return 1;
+	}
+	return n;
 };
 
-const app = new Hono<{ Bindings: Env }>();
+/** 把当前代数 +1，用于“清空所有会话” */
+const bumpGeneration = async (env: Env): Promise<number> => {
+	const cur = await getGeneration(env);
+	const next = cur + 1;
+	await env.RRWEB_SERVER.put(GEN_KEY, String(next));
+	return next;
+};
+
+/** 根据代数 + sessionId 生成真正的 KV key */
+const buildKey = (gen: number, sessionId: string): string =>
+	`${gen}:${sessionId}`;
+
+/** 从 KV key 里反推出 sessionId（前提：key 形如 `${gen}:xxx`） */
+const extractSessionId = (gen: number, name: string): string =>
+	name.slice(`${gen}:`.length);
+
+// -------------------------------------------------
 
 // 全局 CORS
 app.use("*", cors());
 
 // 创建会话
 app.post("/session", async (c) => {
+	const gen = await getGeneration(c.env);
 	const sessionId = crypto.randomUUID();
-	console.log("create session:", sessionId);
+	const key = buildKey(gen, sessionId);
 
-	await c.env.RRWEB_SERVER.put(sessionId, JSON.stringify([]));
+	console.log("create session:", { gen, sessionId, key });
 
-	// 保持简单版本即可
+	// 初始化为空数组
+	await c.env.RRWEB_SERVER.put(key, JSON.stringify([]));
+
 	return c.json({ sessionId });
 });
 
@@ -56,8 +91,11 @@ app.post("/events", async (c) => {
 			return c.json({ error: "missing sessionId" }, 400);
 		}
 
+		const gen = await getGeneration(c.env);
+		const key = buildKey(gen, sessionId);
+
 		// 读取已有事件（如无则为空数组）
-		const exist = await c.env.RRWEB_SERVER.get(sessionId, "json");
+		const exist = await c.env.RRWEB_SERVER.get(key, "json");
 		const existingEvents: RRWebEvent[] = Array.isArray(exist) ? exist : [];
 
 		// 还原本次上报的 batch
@@ -65,7 +103,10 @@ app.post("/events", async (c) => {
 
 		if (body.compressed) {
 			if (!body.payload) {
-				return c.json({ error: "missing payload for compressed request" }, 400);
+				return c.json(
+					{ error: "missing payload for compressed request" },
+					400
+				);
 			}
 
 			// base64 → Uint8Array
@@ -83,7 +124,7 @@ app.post("/events", async (c) => {
 		const allEvents = existingEvents.concat(batch);
 
 		// KV 不支持“追加”文件，只能整体覆盖
-		await c.env.RRWEB_SERVER.put(sessionId, JSON.stringify(allEvents));
+		await c.env.RRWEB_SERVER.put(key, JSON.stringify(allEvents));
 
 		return c.json({ ok: true, count: batch.length });
 	} catch (e: any) {
@@ -100,7 +141,9 @@ app.post("/sessions/get", async (c) => {
 		return c.json({ error: "missing sessionId" }, 400);
 	}
 
-	const data = await c.env.RRWEB_SERVER.get(sessionId, "json");
+	const gen = await getGeneration(c.env);
+	const key = buildKey(gen, sessionId);
+	const data = await c.env.RRWEB_SERVER.get(key, "json");
 
 	if (!data) {
 		return c.json({ error: "session not found" }, 404);
@@ -111,17 +154,24 @@ app.post("/sessions/get", async (c) => {
 	return c.json({ events });
 });
 
-// 列出所有会话
+// 列出当前代数下的所有会话
 app.post("/sessions/list", async (c) => {
-	// KV 的 list 会分页，这里简单处理：只列出第一页
-	const list = await c.env.RRWEB_SERVER.list();
+	const gen = await getGeneration(c.env);
+	const prefix = `${gen}:`;
 
-	const sessions = list.keys.map((k) => k.name);
+	// 只列出当前代的 key
+	const list = (await c.env.RRWEB_SERVER.list({
+		prefix,
+	})) as any;
+
+	const sessions = (list.keys as { name: string }[])
+		.map((k) => k.name)
+		.map((name) => extractSessionId(gen, name));
 
 	return c.json({ sessions });
 });
 
-// 删除单个会话
+// 删除当前代数中的单个会话
 app.post("/sessions/remove", async (c) => {
 	try {
 		const { sessionId } = (await c.req.json()) as { sessionId?: string };
@@ -130,12 +180,15 @@ app.post("/sessions/remove", async (c) => {
 			return c.json({ ok: false, error: "missing sessionId" }, 400);
 		}
 
-		const data = await c.env.RRWEB_SERVER.get(sessionId);
+		const gen = await getGeneration(c.env);
+		const key = buildKey(gen, sessionId);
+
+		const data = await c.env.RRWEB_SERVER.get(key);
 		if (!data) {
 			return c.json({ ok: false, error: "session not found" }, 404);
 		}
 
-		await c.env.RRWEB_SERVER.delete(sessionId);
+		await c.env.RRWEB_SERVER.delete(key);
 		return c.json({ ok: true, message: `session ${sessionId} removed` });
 	} catch (e: any) {
 		console.error(e);
@@ -143,27 +196,17 @@ app.post("/sessions/remove", async (c) => {
 	}
 });
 
-// 清空所有会话（注意：大量会话时会比较慢）
+// 清空所有会话（逻辑清空：O(1)，秒生效）
 app.post("/sessions/clear", async (c) => {
 	try {
-		let cursor: string | undefined = undefined;
+		const nextGen = await bumpGeneration(c.env);
+		console.log("bump generation to", nextGen);
 
-		while (true) {
-			// 必须为 KVNamespaceListResult 指定泛型，如 <unknown>
-			const result: KvListPage = await c.env.RRWEB_SERVER.list({ cursor });
-
-			for (const k of result.keys) {
-				await c.env.RRWEB_SERVER.delete(k.name);
-			}
-
-			if (!result.cursor) {
-				break; // 没有下一页
-			}
-
-			cursor = result.cursor;
-		}
-
-		return c.json({ ok: true, message: "all sessions cleared" });
+		return c.json({
+			ok: true,
+			message: "all sessions cleared (generation bumped)",
+			generation: nextGen,
+		});
 	} catch (e: any) {
 		console.error(e);
 		return c.json({ ok: false, error: e?.message ?? "internal error" }, 500);
